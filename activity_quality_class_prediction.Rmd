@@ -1,0 +1,921 @@
+---
+title: "Activity Quality Class Prediction"
+author: "Vince Force"
+date: "28 janvier 2018"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+```{r loaddependencies}
+library(caret)
+library(ggplot2)
+library(MASS)
+library(ipred)
+library(plyr)
+library(e1071)
+library(mboost)
+library(reshape2)
+library(nnet)
+library(randomForest)
+library(gbm)
+library(ipred)
+library(rpart)
+library(adabag)
+library(foreach)
+library(import)
+library(knitr)
+library(corrplot)
+library(rpart.plot)
+```
+
+## Executive summary
+
+The goal of this project will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways.
+We fill fit various models to get a prediction on a validation dataset where the classe information is not provided.
+
+The overall approach is to use cross-validation (split the data in pml-training.csv into training and testing data sets) to select / tune various models.
+
+In order to obtain the best prediction, we perform a benchmark of various algorithms, comparing accuracy, execution time and "correct" prediction on validation set. Will the winner be Random Forest, as often ?
+
+Finally, we use the data collected during the benchmark to form ensembling models. Will there be new winner ?
+
+## Data
+
+After loading the trainig and testing datasets, we perform an exploratory analysis on the training dataset.
+
+We take the data in pml-testing.csv as validation data.
+
+We will split the data in pml-training.csv into training and testing data sets, to perform cross-validation.
+
+Finally, the types of predictors are integer, numeric and unordinal factor. 
+
+The class column contains 5 values : A, B, C, D, E.
+
+These values are unordered, we are in the case of classification with multinomial outcome (not ordinal factor).
+
+### Loading
+
+```{r data-load, echo=TRUE}
+analysis <- read.csv("pml-training.csv")
+validation <- read.csv("pml-testing.csv")
+dimAnal <- dim(analysis)
+dimValid <- dim(validation)
+```
+
+The prediction dataset has `r dimAnal[2]` columns and `r dimAnal[1]` rows.
+The validation dataset has `r dimValid[2]` columns and `r dimValid[1]` rows.
+
+### Cleaning
+
+A quick look at validation dataset shows that many columns have only NA values. These columns are to be removed in all datasets (training, testing, validation), as the can not be predictors in the validation case.
+
+The columns which are not relevant to form a model of the practice are to be deleted. We discard the 7 first columns except user_name (maybe the information could be useful for validation in case of repetitive behaviour by user) and num_window. 
+
+The last column of validation dataset is the line number, to be deleted.
+
+```{r data-clean, echo=TRUE}
+cleanData <- function(analysis, validation) {
+    table(complete.cases(analysis))
+    table(complete.cases(validation))
+    indColsNA <- sapply(colnames(validation),
+        function(cn) {sum(is.na(validation[, cn])) == dim(validation)[1]})
+    analysis <- analysis[, !indColsNA]
+    validation <- validation[, !indColsNA]
+    table(complete.cases(analysis))
+    table(complete.cases(validation))
+    analysis <- analysis[,-c(1, 3, 4, 5, 6)]
+    validation <- validation[,-c(1, 3, 4, 5, 6, dim(validation)[2])]
+    dim(analysis); dim(validation)
+    return(list(analysis, validation))
+}
+
+cD <- cleanData(analysis, validation)
+analysis <- cD[[1]]
+validation <- cD[[2]]
+dimAnal <- dim(analysis)
+dimValid <- dim(validation)
+```
+
+We get, after data cleaning, `r dimAnal[2] - 1` features for one outcome to predict, without any NA value.
+
+### Exploratory analysis
+
+We try to find correlations between the features.
+
+These are linked to the 4 captors used for original measures.
+Let us group the analysis by captor.
+
+We draw a correlation plot for each of the 10 couples of captors.
+On the first plot, the diagonal of the correlation matrix.
+On the second plot, the other items, from the diagonal to the corner (of the correlation matrix).
+
+```{r data-explore-1, fig.height=7, fig.align="center"}
+
+drawCorrPlot <- function(x, y = NULL, title = "", mar) {
+    if (is.null(y)) {cm <- cor(x)}
+    else {cm <- cor(x, y)}
+    corrplot(cm, method="circle", tl.col = "black", title = title,
+             mar = mar, cl.ratio = 0.25)
+}
+
+colNamessbycaptor <- function(captor, ds) {
+    return(grep(paste("_(", captor, ")", sep = ""), colnames(ds), value = TRUE))
+}
+
+anNum <- analysis[, 1:dim(analysis)[2]-1]
+anNum <- anNum[-1]
+mar <- c(2, 1, 2, 1)
+par(oma = c(1, 0, 0, 1), adj = 0.7)
+par(mfrow = c(1, 1), cex = 0.5)
+# drawCorrPlot(anNum)
+captors <- c("belt", "arm", "dumbbell", "forearm")
+cNSet <- sapply(captors, colNamessbycaptor, ds = analysis)
+par(mfrow = c(2, 2), cex = 0.6)
+drawCorrPlot(anNum[, cNSet[, "belt"]], title = "belt vs belt", mar = mar)
+drawCorrPlot(anNum[, cNSet[, "arm"]], title = "arm vs arm", mar = mar)
+drawCorrPlot(anNum[, cNSet[, "dumbbell"]], title = "dumbbell vs dumbbell", mar = mar)
+drawCorrPlot(anNum[, cNSet[, "forearm"]], title = "forearm vs forearm", mar = mar)
+```
+```{r data-explore-2, fig.height=5, fig.align="center"}
+par(oma = c(1, 0, 0, 0), adj = 0.7)
+par(mfrow = c(2, 3), cex = 0.5)
+drawCorrPlot(anNum[, cNSet[, "belt"]], anNum[, cNSet[, "arm"]],
+             title = "belt vs arm", mar = mar)
+drawCorrPlot(anNum[, cNSet[, "arm"]], anNum[, cNSet[, "dumbbell"]],
+             title = "arm vs dumbbell", mar = mar)
+drawCorrPlot(anNum[, cNSet[, "dumbbell"]], anNum[, cNSet[, "forearm"]],
+             title = "dumbbell vs forearm", mar = mar)
+drawCorrPlot(anNum[, cNSet[, "belt"]], anNum[, cNSet[, "dumbbell"]],
+             title = "belt vs dumbbell", mar = mar)
+drawCorrPlot(anNum[, cNSet[, "arm"]], anNum[, cNSet[, "forearm"]],
+             title = "arm vs forearm", mar = mar)
+drawCorrPlot(anNum[, cNSet[, "belt"]], anNum[, cNSet[, "forearm"]],
+             title = "belt vs forearm", mar = mar)
+```
+
+Nice. But a bit complicated handle with.
+
+Fortunately, we have many other approaches for classification !
+
+## Training and testing datasets
+
+For performing cross-validation, we split the original training dataset in two datasets, with a proportion of 70% for the resulting training dataset.
+
+The original testing dataset will be used for validation.
+
+```{r train-test-dataset}
+# effSeed <- sample(1:2^15, 1)
+# print(sprintf("Seed for session: %s", effSeed))
+# set.seed(effSeed)
+set.seed(25651)
+inTrain <- createDataPartition(analysis$classe, p = 0.7, list = FALSE)
+training <- analysis[inTrain,]; testing <- analysis[-inTrain,]
+dimTraining <- dim(training); dimTesting <- dim(testing)
+```
+
+The original training dataset has been splitted into a (new) training dataset (`r dimTraining[1]` rows) and a testing dataset (`r dimTesting[1]` rows).
+
+## Analysis
+
+Algoritms provided with R have various implementations (on train command usage, or objects returned, ...). The benchmark code has to deal with this.
+
+```{r benchmark-functions}
+accuracy_rate <- function(test, prediction){
+    cm <- table(test$classe, prediction)
+    acc <- sum(diag(cm)) / sum(cm)
+    return(acc)
+}
+
+listVals <- function(l) {
+    if (class(l) == "list") {
+        nv <- unlist(l); nm <- names(nv); lg <- length(nv)
+        if (lg != 0) {
+            res <- paste(nm[1], nv[1], sep = " = ")
+            if (lg >= 2) {
+                for (i in 2:lg) {res <- paste(res, paste(nm[i], nv[i], sep = " = "), sep = ", ")} 
+            }
+        }
+        else {res = ""}
+    }
+    else {res <- l}
+    return(res)
+}
+
+boProcess <- function(prPOpt, trnOpt, prdOpt, fnName, fnOpt, mdlName, cmOpt, tmOpt,
+                      training, testing, validation, frml) {
+    testProbClassePred <- NULL
+    if (is.null(prPOpt)) {
+        trainDS <- training
+        testDS <- testing
+        valDS <- validation
+        prPOpt <- "None"
+    }
+    else {
+        preProc <- preProcess(training[,-1], method = prPOpt)
+        trainDS <- predict(preProc, training[,-1])
+        testDS <- predict(preProc, testing[,-1])
+        valDS <- predict(preProc, validation)
+    }
+    if (is.null(trnOpt)) {
+        if (is.null(tmOpt)) {
+            mdlFit <- do.call(fnName,
+                    append(list(formula = as.formula(frml), data = trainDS), fnOpt),
+                           envir = environment())
+        }
+        else {
+            if (is.null(fnOpt)) {
+                mdlFit <- train(as.formula(frml), method = tmOpt, data = trainDS)
+            }
+            else {
+                mdlFit <- do.call("train",
+                    append(list(form = as.formula(frml), data = trainDS, method = tmOpt),
+                           fnOpt))
+            }
+        }
+        trnOpt <- "None"
+    }
+    else {
+        trnCtrl <- do.call("trainControl", trnOpt)
+        if (is.null(tmOpt)) {
+           mdlFit <- train(as.formula(frml), method = fn, data = trainDS, trnControl = trnCtrl)
+        }
+        else {
+            mdlFit <- train(as.formula(frml), method = tmOpt, data = trainDS,
+                            trnControl = trnCtrl)
+        }
+    }
+    if (cmOpt != 0) {
+        if (is.null(prdOpt)) {
+            if (cmOpt == 3) {
+                testClassePred <- predict(mdlFit, testDS)$class
+                vP <- predict(mdlFit, valDS)$class
+                cm <- confusionMatrix(testClassePred, testDS$classe)
+                acc <- round(as.numeric(cm$overall), 4)[1]
+            }
+            else {
+                testProbClassePred <- predict(mdlFit, testDS)
+                vPProb <- predict(mdlFit, valDS)
+            }
+        }
+        else {
+            testProbClassePred <- do.call("predict", append(list(mdlFit, testDS), prdOpt))
+            vPProb <- do.call("predict", append(list(mdlFit, valDS), prdOpt))
+        }
+        if (cmOpt == 1) {
+            testClassePred <- factor(levels(trainDS$classe)[apply(testProbClassePred,
+                                                               1, which.max)])
+            vP <- as.character(factor(levels(trainDS$classe)[apply(vPProb, 1, which.max)]))
+            acc <- round(accuracy_rate(testDS, testClassePred), 4)
+        }
+        if (cmOpt == 2) {
+            testClassePred <- factor(levels(trainDS$classe)[apply(testProbClassePred[, , 1],
+                                                               1, which.max)])
+            vP <- as.character(factor(levels(trainDS$classe)[apply(vPProb[, , 1],
+                                                                   1, which.max)]))
+            acc <- round(accuracy_rate(testDS, testClassePred), 4)
+        }
+    }
+    else {
+        if (is.null(prdOpt)) {
+            testClassePred <- predict(mdlFit, testDS)
+            vP <- as.character(predict(mdlFit, valDS))
+        }
+        else {
+            testClassePred <- do.call("predict", append(list(mdlFit, testDS), prdOpt))
+            vP <- as.character(do.call("predict", append(list(mdlFit, valDS), prdOpt)))
+        }
+        cm <- confusionMatrix(testClassePred, testDS$classe)
+        acc <- round(as.numeric(cm$overall), 4)[1]
+    }
+    return(list(mdlName = mdlName, acc = acc, vP = vP, testClassePred = testClassePred,
+                testProbClassePred = testProbClassePred, mdlFit = mdlFit))
+}
+
+benchone <- function(model, training, testing, validation, formula) {
+    prPOpt <- model$pPO; trnOpt <- model$tO; prdOpt <- model$prO; fnName <- model$fn
+    fnOpt <- model$fnO; mdlName <- model$mdl; cmOpt <- model$cmO; tmOpt <- model$tm
+    frml <- formula
+    start.time <- Sys.time()
+    print(paste(">> >> >> Start model", mdlName, Sys.time(), sep = " - "))
+    st <- system.time(
+        bop <- boProcess(prPOpt, trnOpt, prdOpt, fnName, fnOpt, mdlName, cmOpt, tmOpt,
+                        training, testing, validation, frml))
+    st.usr <- round(as.numeric(st[1]), 2); st.sys <- round(as.numeric(st[2]), 2)
+    st.elps <- round(as.numeric(st[3]), 2)
+    end.time <- Sys.time(); diff.time <- end.time - start.time
+    ex <- paste(round(diff.time[[1]], 2), units(diff.time))
+    mdlName <- bop$mdlName; acc <- bop$acc; vP <- bop$vP
+    testProbClassePred <- bop$testProbClassePred; testClassePred <- bop$testClassePred
+    mdlFit = bop$mdlFit
+    mdlRes <- data.frame(
+        Name = mdlName, Accuracy = acc, st.elps = st.elps,
+        p1 = vP[1], p2 = vP[2], p3 = vP[3], p4 = vP[4], p5 = vP[5],
+        p6 = vP[6], p7 = vP[7], p8 = vP[8], p9 = vP[9], p10 = vP[10],
+        p11 = vP[11], p12 = vP[12], p13 = vP[13], p14 = vP[14], p15 = vP[15],
+        p16 = vP[16], p17 = vP[17], p18 = vP[18], p19 = vP[19], p20 = vP[20],
+        stringsAsFactors = FALSE)
+    # mdlRes <- data.frame(
+    #     Name = mdlName, Accuracy = acc, time = ex,
+    #     st.usr = st.usr, st.sys = st.sys, st.elps = st.elps,
+    #     p1 = vP[1], p2 = vP[2], p3 = vP[3], p4 = vP[4], p5 = vP[5],
+    #     p6 = vP[6], p7 = vP[7], p8 = vP[8], p9 = vP[9], p10 = vP[10],
+    #     p11 = vP[11], p12 = vP[12], p13 = vP[13], p14 = vP[14], p15 = vP[15],
+    #     p16 = vP[16], p17 = vP[17], p18 = vP[18], p19 = vP[19], p20 = vP[20],
+    #     stringsAsFactors = FALSE)
+    return(list(mdlRes = mdlRes, testProbClassePred = testProbClassePred,
+                testClassePred = testClassePred, mdlFit = mdlFit))
+}
+
+benchmark <- function(models, training, testing, validation, frml) {
+    # Available parameters from the items of models argument
+    # pPO : method argument for preprocessing (can include vector of methods)
+    # tO : list of arguments for trainControl command
+    # prO : list of arguments for predict command
+    # fn : name of R classification function
+    # fnO : list of arguments of R classification function
+    # mdl : name of the model
+    # cmO : option for computing confusion matrix and accuracy
+    # tm : method argument for train command 
+
+    bModels <- data.frame()
+    predictions <- list()
+    predprobs <- list()
+    modelFits <- list()
+    for (ind_model in 1:length(models)) {
+        model <- models[[ind_model]]
+        mdlName <- model$mdl
+        bo <- benchone(model = model, training, testing, validation, formula = frml)
+        mdlRes <- bo$mdlRes
+        testProbClassePred <- bo$testProbClassePred
+        testClassePred <- bo$testClassePred
+        mdlFit <- bo$mdlFit
+        bModels <- rbind(bModels, mdlRes, stringsAsFactors = FALSE)
+        predprobs[[mdlName]] <- testProbClassePred
+        predictions[[mdlName]] <- testClassePred
+        modelFits[[mdlName]] <- mdlFit
+    }
+    return(list(mdls = bModels, prdcts = predictions, prdprbs = predprobs, modelFits = modelFits))
+}
+```
+
+### Benchmark of various models
+
+Now we launch the benchmark... Fortunately, if you read the HTML document, you don't have to wait too long !
+
+```{r benchmark-analysis, cache = TRUE}
+
+# Classification algorithms for non ordinal factor as outcome and continuous and factors as predictors
+benchModels <- c()
+# pPO : method argument for preprocessing (can include vector of methods)
+# tO : list of arguments for trainControl command
+# prO : list of arguments for predict command
+# fn : name of R classification function
+# fnO : list of arguments of R classification function
+# mdl : name of the model
+# cmO : option for computing confusion matrix and accuracy
+# tm : method argument for train command 
+
+# Multinomial regression : multinom
+benchModels <- append(benchModels, list(list(mdl = "Multinom", fn = "multinom", cmO = 0,
+                                             fnO = c(trace = FALSE))))
+
+# Multinomial regression : multinom with preprocess scale
+benchModels <- append(benchModels, list(list(mdl = "Multinom with preprocess scale",
+                                fn = "multinom", fnO = c(trace = FALSE), cmO = 0,
+                                pPO = "scale")))
+
+# Multinomial regression : multinom with preprocess pca
+benchModels <- append(benchModels, list(list(mdl = "Multinom with preprocess pca",
+                                fn = "multinom", fnO = c(trace = FALSE), cmO = 0,
+                                pPO = "pca")))
+
+# Multinomial regression : multinom with preprocess range
+benchModels <- append(benchModels, list(list(mdl = "Multinom with preprocess range",
+                                fn = "multinom", fnO = c(trace = FALSE), cmO = 0,
+                                pPO = "range")))
+
+# Multinomial regression : multinom with preprocess range (tuned)
+################# Same result as Multinom with preprocess range
+# benchModels <- append(benchModels, list(list(mdl = "Multinom with preprocess range (tuned)",
+#                                 fn = "multinom",  cmO = 0,
+#                                 pPO = c("range"), fnO = list(summ = 2))))
+
+# Multinomial regression : multinom with preprocess range and cross validation
+################# Same result as Multinom with preprocess range
+# benchModels <- append(benchModels, list(list(
+#     mdl = "Multinom with preprocess range and cross validation",
+#                                 fn = "multinom",  cmO = 0,
+#                                 pPO = c("range"),
+#                                 tO = list(method = "cv"),
+#                                 tmO = "multinom")))
+
+# lda2 Linear Discriminant Analysis
+benchModels <- append(benchModels, list(list(mdl = "Linear Discriminant Analysis", fn = "lda2",
+                                             cmO = 0, tmO = "lda2")))
+
+# rpart default 
+benchModels <- append(benchModels, list(list(mdl = "Rpart", fn = "rpart",
+                                             cmO = 1, fnO = list(method = "class"))))
+
+# rpart with preprocess pca
+benchModels <- append(benchModels, list(list(
+                                mdl = "Rpart with preprocess pca", fn = "rpart",  cmO = 1, 
+                                fnO = list(method = "class"), pPO = "pca")))
+
+# rpart tuned (minsplit = 30, minbucket = 10, cp = 0.0001)
+benchModels <- append(benchModels, list(list(
+                        mdl = "Rpart tuned (minsplit = 30, minbucket = 10, cp = 0.0001)",
+                        fn = "rpart", cmO = 1, fnO = list(method = "class",
+                        control = rpart.control(minsplit = 30, minbucket = 10, cp = 0.0001)))))
+
+# gbm default parameters
+benchModels <- append(benchModels, list(list(mdl = "GBM", fn = "gbm",  cmO = 2,
+                                fnO = list(n.trees = 100, distribution = "multinomial"),
+                                prO = list(n.trees = 100, type = "response"))))
+
+# gbm parameters interaction.depth = 1, shrinkage = 0.1
+benchModels <- append(benchModels, list(list(
+                                mdl = "GBM with interaction.depth = 1, shrinkage = 0.1",
+                                fn = "gbm",  cmO = 2,
+                                fnO = list(n.trees = 100, distribution = "multinomial",
+                                            interaction.depth = 1, shrinkage = 0.1),
+                                prO = list(n.trees = 100, type = "response"))))
+
+# gbm parameters interaction.depth = 2, shrinkage = 0.1
+benchModels <- append(benchModels, list(list(
+                                mdl = "GBM with interaction.depth = 2, shrinkage = 0.1",
+                                fn = "gbm",  cmO = 2,
+                                fnO = list(n.trees = 100, distribution = "multinomial",
+                                            interaction.depth = 2, shrinkage = 0.1),
+                                prO = list(n.trees = 100, type = "response"))))
+
+# gbm parameters interaction.depth = 3, shrinkage = 0.1
+benchModels <- append(benchModels, list(list(
+                                mdl = "GBM with interaction.depth = 3, shrinkage = 0.1",
+                                fn = "gbm",  cmO = 2,
+                                fnO = list(n.trees = 100, distribution = "multinomial",
+                                            interaction.depth = 3, shrinkage = 0.1),
+                                prO = list(n.trees = 100, type = "response"))))
+
+# gbm parameters interaction.depth = 4, shrinkage = 0.1
+benchModels <- append(benchModels, list(list(
+                                mdl = "GBM with interaction.depth = 4, shrinkage = 0.1",
+                                fn = "gbm",  cmO = 2,
+                                fnO = list(n.trees = 100, distribution = "multinomial",
+                                            interaction.depth = 4, shrinkage = 0.1),
+                                prO = list(n.trees = 100, type = "response"))))
+
+# gbm parameters interaction.depth = 6, shrinkage = 0.1
+benchModels <- append(benchModels, list(list(
+                                mdl = "GBM with interaction.depth = 6, shrinkage = 0.1",
+                                fn = "gbm",  cmO = 2,
+                                fnO = list(n.trees = 100, distribution = "multinomial",
+                                            interaction.depth = 6, shrinkage = 0.1),
+                                prO = list(n.trees = 100, type = "response"))))
+
+# gbm parameters interaction.depth = 7, shrinkage = 0.1
+benchModels <- append(benchModels, list(list(
+                                mdl = "GBM with interaction.depth = 7, shrinkage = 0.1",
+                                fn = "gbm",  cmO = 2,
+                                fnO = list(n.trees = 100, distribution = "multinomial",
+                                            interaction.depth = 7, shrinkage = 0.1),
+                                prO = list(n.trees = 100, type = "response"))))
+
+# gbm parameters interaction.depth = 10, shrinkage = 0.1
+benchModels <- append(benchModels, list(list(
+                                mdl = "GBM with interaction.depth = 10, shrinkage = 0.1",
+                                fn = "gbm",  cmO = 2,
+                                fnO = list(n.trees = 100, distribution = "multinomial",
+                                            interaction.depth = 10, shrinkage = 0.1),
+                                prO = list(n.trees = 100, type = "response"))))
+
+# treebag default
+benchModels <- append(benchModels, list(list(mdl = "Treebag", cmO = 0, tm0 = "treebag")))
+
+# bagging default
+benchModels <- append(benchModels, list(list(mdl = "Bagging", fn = "bagging",  cmO = 3)))
+
+# boosting
+benchModels <- append(benchModels, list(list(
+                        mdl = "Boosting with boos = FALSE, mfinal = 100, coeflearn = 'Zhu'",
+                        fn = "boosting",  cmO = 3,
+                        fnO = list(boos = FALSE, mfinal = 100, coeflearn = 'Zhu'))))
+
+# svm linear kernel
+benchModels <- append(benchModels, list(list(
+                        mdl = "Support Vector Machines linear kernel", fn = "svm",  cmO = 0,
+                        fnO = list(type = "C-classification", kernel = "linear"))))
+
+# svm radial kernel
+benchModels <- append(benchModels, list(list(
+                        mdl = "Support Vector Machines radial kernel", fn = "svm",  cmO = 0,
+                        fnO = list(type = "C-classification", kernel = "radial"))))
+
+# svm polynomial degree 3 kernel
+benchModels <- append(benchModels, list(list(
+                        mdl = "Support Vector Machines kernel polynomial (3)",
+                        fn = "svm",  cmO = 0, fnO = list(type = "C-classification",
+                                                         kernel = "polynomial", degree = 3))))
+
+# svm polynomial degree 2 kernel
+benchModels <- append(benchModels, list(list(
+                        mdl = "Support Vector Machines kernel polynomial (2)",
+                        fn = "svm",  cmO = 0, fnO = list(type = "C-classification",
+                                                         kernel = "polynomial", degree = 2))))
+
+# Random forest
+benchModels <- append(benchModels, list(list(mdl = "Random forest", fn = "randomForest",
+                                             cmO = 0)))
+
+bm <- benchmark(benchModels, training, testing, validation, 'classe ~.')
+```
+
+### Benchmark of various models : results
+
+And here are the first results. The execution (st.elps) time is given by system.time() method. Other times are computed, but not showmn on the final results for presentation convenience. We could have found important variations in cpu usage, to be taken into account for a more realistic benchmark.
+
+The models used in the benchmark are returned, for further investigation and plotting purposes.
+
+The table below shows modles benchmark results, classed by Accuracy in descending order.
+
+The second table give details on models type / tuning parameters, and the rank following Accuracy scoring.
+
+The Random Forest algorithm is the last tested (**Model_24**).
+
+```{r benchmark-analysis-results}
+dfRes <- bm$mdls
+refPredValOK <- dfRes[dfRes$Name == "Random forest", 4:23]
+errV <- c()
+for (ind in 1:nrow(dfRes)) {
+    if (dfRes[ind, "Name"] == "Random forest") {
+        errV <- c(errV, 0)
+    }
+    else {
+        comp <- apply(dfRes[ind, 4:23], 1, `==`, refPredValOK)
+        errV <- c(errV, sum(comp==FALSE))
+    }
+}
+dfRes <- cbind(dfRes, errV)
+fnTrc <- paste("benchmark_", format(Sys.time(), format = "%Y-%m-%d_%H-%M-%S", tz = "GMT"),
+               ".csv", sep = "")
+write.csv2(dfRes, file = fnTrc)
+
+dfResPrint <- dfRes
+dfResPrint$Name <- sapply(1:dim(dfRes)[1], function(num) {paste("Model", num, sep = "_")})
+
+dfAlgo <- data.frame(Name = dfResPrint$Name, Algo = dfRes$Name, Accuracy = dfRes$Accuracy,
+                     st.elps = dfRes$st.elps, errV = dfRes$errV)
+dfResPrintOrd <- dfResPrint[order(dfResPrint$Accuracy, decreasing = TRUE),]
+rankAcc <- data.frame(rankAcc = as.numeric(rownames(dfResPrintOrd)))
+dfAlgo <- cbind(dfAlgo, rankAcc)
+
+kable(dfResPrintOrd)
+kable(dfAlgo)
+```
+
+On accuracy score, Random Forest is beaten, and there are challengers with close execution time.
+
+We have many models with "0 errors" (all with same prediction as rf) on validation dataset.
+
+But what of global scores when combining these models?
+
+### Combining models according to benchmark
+
+We try several manners to combine the models, using (except for one case) a classification of the predictions (A, B, C, D, E) of individual models as predictors (with a tuned rpart). The predictions returned by the benchmark function are used for saving computation time.
+
+
+```{r benchmark-combine}
+
+combine3Models <- function(testing, predictions, modelsRes, modNames, refPredValOK) {
+    predMod1 <- predictions[[modNames[1]]]
+    predMod2 <- predictions[[modNames[2]]]
+    predMod3 <- predictions[[modNames[3]]]
+    combDS <- data.frame(pred1 = predMod1,
+                         pred2 = predMod2,
+                         pred3 = predMod3,
+                         classe = testing$classe)
+    st <- system.time(combMod <- rpart(classe ~ ., method = "class", data = combDS,
+                     control = rpart.control(minsplit = 30, minbucket = 10,
+                                             cp = 0.0001)))
+    combPred <- predict(combMod, combDS)
+    cm <- confusionMatrix(factor(levels(testing$classe)[apply(combPred,1, which.max)]), combDS$classe)
+    acc <- round(cm$overall[1], 4)
+    pred1 <- as.character(modelsRes[modelsRes$Name == modNames[1], 4:23])
+    pred2 <- as.character(modelsRes[modelsRes$Name == modNames[2], 4:23])
+    pred3 <- as.character(modelsRes[modelsRes$Name == modNames[3], 4:23])
+    combValDS <- data.frame(pred1 = as.factor(pred1), pred2 = as.factor(pred2), pred3 = as.factor(pred3))
+    combPredValProb <- predict(combMod, combValDS)
+    combPredVal <- factor(levels(testing$classe)[apply(combPredValProb,1, which.max)])
+    st.elps <- round(st[3] + modelsRes[modelsRes$Name == modNames[1], "st.elps"] + modelsRes[modelsRes$Name == modNames[2], "st.elps"] + modelsRes[modelsRes$Name == modNames[3], "st.elps"], 2)
+    vP <- as.character(combPredVal)
+    combPredVal <- data.frame(
+        p1 = vP[1], p2 = vP[2], p3 = vP[3], p4 = vP[4], p5 = vP[5], p6 = vP[6], p7 = vP[7],
+        p8 = vP[8], p9 = vP[9], p10 = vP[10], p11 = vP[11], p12 = vP[12], p13 = vP[13],
+        p14 = vP[14], p15 = vP[15], p16 = vP[16], p17 = vP[17], p18 = vP[18], p19 = vP[19],
+        p20 = vP[20], stringsAsFactors = FALSE)
+    comp <- apply(combPredVal, 1, `==`, refPredValOK)
+    errV <- sum(comp==FALSE)
+    combName <- paste(modNames[1], modNames[2], modNames[3], sep = " |+| ")
+    return(data.frame(Name = combName, Accuracy = acc, st.elps = st.elps,
+                      p1 = vP[1], p2 = vP[2], p3 = vP[3], p4 = vP[4], p5 = vP[5],
+                      p6 = vP[6], p7 = vP[7], p8 = vP[8], p9 = vP[9], p10 = vP[10],
+                      p11 = vP[11], p12 = vP[12], p13 = vP[13], p14 = vP[14], p15 = vP[15],
+                      p16 = vP[16], p17 = vP[17], p18 = vP[18], p19 = vP[19], p20 = vP[20],
+                      errV = errV, stringsAsFactors = FALSE, row.names = c("")))
+}
+
+
+combinedModels <- data.frame()
+
+# Combined models - 1 - Weak predictors
+cM <- combine3Models(testing, bm$prdcts, bm$mdls,
+                      c("Multinom with preprocess range",
+                                          "Rpart",
+                                          "GBM with interaction.depth = 1, shrinkage = 0.1"),
+                                          refPredValOK)
+combinedModels <- rbind(combinedModels, cM)
+
+# Combined models - 2
+cM <- combine3Models(testing, bm$prdcts, bm$mdls,
+                     c("Rpart tuned (minsplit = 30, minbucket = 10, cp = 0.0001)",
+                                          "GBM with interaction.depth = 2, shrinkage = 0.1",
+                                          "Support Vector Machines radial kernel"),
+                                            refPredValOK)
+combinedModels <- rbind(combinedModels, cM)
+# Combined models - 3
+cM <- combine3Models(testing, bm$prdcts, bm$mdls,
+                     c("Rpart tuned (minsplit = 30, minbucket = 10, cp = 0.0001)",
+                                          "GBM with interaction.depth = 2, shrinkage = 0.1",
+                                          "GBM with interaction.depth = 3, shrinkage = 0.1"),
+                     refPredValOK)
+combinedModels <- rbind(combinedModels, cM)
+
+# Combined models - 4  (3 with combination of probabilities)
+combine3ModelsProb <- function(testing, predictionsProb, refPredValOK) {
+    predModProb1 <- predictionsProb[["Rpart tuned (minsplit = 30, minbucket = 10, cp = 0.0001)"]]
+    predModProb2 <- predictionsProb[["GBM with interaction.depth = 2, shrinkage = 0.1"]]
+    predModProb3 <- predictionsProb[["GBM with interaction.depth = 4, shrinkage = 0.1"]]
+    # linear combination of probabilities with tuned weights for maximising accuracy gain
+    predModProb <- (0.3*predModProb1 + 0.3*predModProb2[,,1] + 0.4*predModProb3[,,1])
+    combPred <- factor(levels(testing$classe)[apply(predModProb,1, which.max)])
+    cm <- confusionMatrix(combPred, testing$classe)
+    acc <- round(cm$overall[1], 4)
+    modFit1 <- rpart(formula = classe ~ ., data = testing, method = "class",
+                            control = rpart.control(minsplit = 30, minbucket = 10, cp = 0.0001))
+    predValModProb1 <- predict(modFit1, validation)
+    modFit2 <- gbm(formula = classe ~ ., data = testing, n.trees = 100, distribution = "multinomial",
+                  interaction.depth = 2, shrinkage = 0.1)
+    predValModProb2 <- predict(modFit2, validation, n.trees = 100, type = "response")
+    modFit3 <- gbm(formula = classe ~ ., data = testing, n.trees = 100, distribution = "multinomial",
+                  interaction.depth = 4, shrinkage = 0.1)
+    predValModProb3 <- predict(modFit3, validation, n.trees = 100, type = "response")
+    predValModProb <- (0.3*predValModProb1 + 0.3*predValModProb2[,,1] + 0.4*predValModProb3[,,1])/3
+    vP <- as.character(factor(levels(testing$classe)[apply(predValModProb,1, which.max)]))
+    combPredVal <- data.frame(
+        p1 = vP[1], p2 = vP[2], p3 = vP[3], p4 = vP[4], p5 = vP[5], p6 = vP[6], p7 = vP[7],
+        p8 = vP[8], p9 = vP[9], p10 = vP[10], p11 = vP[11], p12 = vP[12], p13 = vP[13],
+        p14 = vP[14], p15 = vP[15], p16 = vP[16], p17 = vP[17], p18 = vP[18], p19 = vP[19],
+        p20 = vP[20], stringsAsFactors = FALSE)
+    comp <- apply(combPredVal, 1, `==`, refPredValOK)
+    errV <- sum(comp==FALSE)
+
+    combName <- paste("Rpart tuned (minsplit = 30, minbucket = 10, cp = 0.0001)",
+                  "GBM with interaction.depth = 2, shrinkage = 0.1",
+                  "GBM with interaction.depth = 3, shrinkage = 0.1", sep = " |+%| ")
+        
+    return(data.frame(Name = combName, Accuracy = acc, st.elps = 0,
+                      p1 = vP[1], p2 = vP[2], p3 = vP[3], p4 = vP[4], p5 = vP[5],
+                      p6 = vP[6], p7 = vP[7], p8 = vP[8], p9 = vP[9], p10 = vP[10],
+                      p11 = vP[11], p12 = vP[12], p13 = vP[13], p14 = vP[14], p15 = vP[15],
+                      p16 = vP[16], p17 = vP[17], p18 = vP[18], p19 = vP[19], p20 = vP[20],
+                      errV = errV, stringsAsFactors = FALSE, row.names = c("")))
+}
+st <- system.time(cM <- combine3ModelsProb(testing, bm$prdprbs, refPredValOK))
+cM[1, "st.elps"] <- round(st[3], 2)
+combinedModels <- rbind(combinedModels, cM)
+
+# Combined models - 5 for challenging rf
+cM <- combine3Models(testing, bm$prdcts, bm$mdls,
+                     c("Rpart tuned (minsplit = 30, minbucket = 10, cp = 0.0001)",
+                            "GBM with interaction.depth = 1, shrinkage = 0.1",
+                            "GBM with interaction.depth = 4, shrinkage = 0.1"),
+                     refPredValOK)
+combinedModels <- rbind(combinedModels, cM)
+
+
+combine5Models <- function(testing, predictions, modelsRes, modNames, refPredValOK) {
+    predMod1 <- predictions[[modNames[1]]]
+    predMod2 <- predictions[[modNames[2]]]
+    predMod3 <- predictions[[modNames[3]]]
+    predMod4 <- predictions[[modNames[4]]]
+    predMod5 <- predictions[[modNames[5]]]
+    combDS <- data.frame(pred1 = predMod1,
+                         pred2 = predMod2,
+                         pred3 = predMod3,
+                         pred4 = predMod4,
+                         pred5 = predMod5,
+                         classe = testing$classe)
+    st <- system.time(combMod <- rpart(classe ~ ., method = "class", data = combDS,
+                     control = rpart.control(minsplit = 30, minbucket = 10,
+                                             cp = 0.0001)))
+    combPred <- predict(combMod, combDS)
+    cm <- confusionMatrix(factor(levels(testing$classe)[apply(combPred,1, which.max)]), combDS$classe)
+    acc <- round(cm$overall[1], 4)
+    pred1 <- as.character(modelsRes[modelsRes$Name == modNames[1], 4:23])
+    pred2 <- as.character(modelsRes[modelsRes$Name == modNames[2], 4:23])
+    pred3 <- as.character(modelsRes[modelsRes$Name == modNames[3], 4:23])
+    pred4 <- as.character(modelsRes[modelsRes$Name == modNames[4], 4:23])
+    pred5 <- as.character(modelsRes[modelsRes$Name == modNames[5], 4:23])
+    combValDS <- data.frame(pred1 = as.factor(pred1), pred2 = as.factor(pred2),
+                    pred3 = as.factor(pred3), pred4 = as.factor(pred4), pred5 = as.factor(pred5))
+    combPredValProb <- predict(combMod, combValDS)
+    combPredVal <- factor(levels(testing$classe)[apply(combPredValProb,1, which.max)])
+    st.elps <- round(st[3] + modelsRes[modelsRes$Name == modNames[1], "st.elps"] + modelsRes[modelsRes$Name == modNames[2], "st.elps"] + modelsRes[modelsRes$Name == modNames[3], "st.elps"] + modelsRes[modelsRes$Name == modNames[4], "st.elps"] + modelsRes[modelsRes$Name == modNames[5], "st.elps"], 2)
+    vP <- as.character(combPredVal)
+    combPredVal <- data.frame(
+        p1 = vP[1], p2 = vP[2], p3 = vP[3], p4 = vP[4], p5 = vP[5], p6 = vP[6], p7 = vP[7],
+        p8 = vP[8], p9 = vP[9], p10 = vP[10], p11 = vP[11], p12 = vP[12], p13 = vP[13],
+        p14 = vP[14], p15 = vP[15], p16 = vP[16], p17 = vP[17], p18 = vP[18], p19 = vP[19],
+        p20 = vP[20], stringsAsFactors = FALSE)
+    comp <- apply(combPredVal, 1, `==`, refPredValOK)
+    errV <- sum(comp==FALSE)
+    combName <- paste(modNames[1], modNames[2], modNames[3], modNames[4], modNames[5],
+                      sep = " |+| ")
+    return(data.frame(Name = combName, Accuracy = acc, st.elps = st.elps,
+                      p1 = vP[1], p2 = vP[2], p3 = vP[3], p4 = vP[4], p5 = vP[5],
+                      p6 = vP[6], p7 = vP[7], p8 = vP[8], p9 = vP[9], p10 = vP[10],
+                      p11 = vP[11], p12 = vP[12], p13 = vP[13], p14 = vP[14], p15 = vP[15],
+                      p16 = vP[16], p17 = vP[17], p18 = vP[18], p19 = vP[19], p20 = vP[20],
+                      errV = errV, stringsAsFactors = FALSE, row.names = c("")))
+}
+
+# Combined models - 6 - 5 predictors with good performances
+cM <- combine5Models(testing, bm$prdcts, bm$mdls,
+                     c("Rpart tuned (minsplit = 30, minbucket = 10, cp = 0.0001)",
+                            "GBM with interaction.depth = 2, shrinkage = 0.1",
+                            "GBM with interaction.depth = 1, shrinkage = 0.1",
+                            "Multinom with preprocess range",
+                            "Rpart"),
+                     refPredValOK)
+combinedModels <- rbind(combinedModels, cM)
+
+
+
+# Combined models - 7 - TOP OF THE TOP
+cM <- combine5Models(testing, bm$prdcts, bm$mdls,
+                     c("GBM with interaction.depth = 10, shrinkage = 0.1",
+                            "Random forest",
+                            "Treebag",
+                            "Boosting with boos = FALSE, mfinal = 100, coeflearn = 'Zhu'",
+                            "GBM with interaction.depth = 7, shrinkage = 0.1"),
+                     refPredValOK)
+combinedModels <- rbind(combinedModels, cM)
+
+```
+
+And here are the final results.
+
+```{r benchmark-combine-results}
+
+rownames(combinedModels) <- 1:nrow(combinedModels)
+
+fnTrcComb <- paste("benchmark_comb_", format(Sys.time(), format = "%Y-%m-%d_%H-%M-%S", tz = "GMT"),
+               ".csv", sep = "")
+write.csv2(combinedModels, file = fnTrcComb)
+
+combinedModelsPrint <- combinedModels
+combinedModelsPrint$Name <- sapply(1:dim(combinedModels)[1],
+                                   function(num) {paste("Comb", num, sep = "_")})
+
+dfCombAlgo <- data.frame(Name = combinedModelsPrint$Name, Algo = combinedModels$Name)
+rfRow <- data.frame(dfRes[dfRes$Name == "Random forest",])
+rfRow$Name <- "RF"
+combinedModelsPrint <- rbind(combinedModelsPrint, rfRow)
+
+kable(dfCombAlgo)
+kable(combinedModelsPrint)
+```
+
+
+Comments:
+
+1. 3 models - Weak but fast models
+- Yes! A little gain...
+2. 3 models - Not so bad predictors (around 0.95 accuracy) / Best accuracy
+- Yes! A challenger concerning accuracy
+3. 3 models - Fastest to get "correct" prediction on validation dataset
+- Humm... Beats Random Forest for execution time, but fails sometimes on validation
+4. 3 models - Fastest to get "correct" prediction on validation dataset (with combination of probabilities)
+- Humm... Beats Random Forest for execution time, better accuracy than vote version, but fails sometimes on validation
+5. 3 models - Challenging Random Forest on both accuracy and execution time
+- Yes! Close accuracy, execution time (and validation success !) comparing to Random Forest
+6. 5 models - Challenging Random Forest on both accuracy and execution time
+- Humm... Seems like I don't have enough various models to combine...
+7. 5 models : The "best model in the world" !!
+- No comment !!
+
+Finally, on this specific case (with this value of set.seed), the model GBM with interaction.depth = 6 stays the best tradeoff accuracy / execution time. 
+
+## Conclusion
+
+A well tuned, step by step constructed model can beat the champions.
+
+Additional investigations could be performed :
+
+- Try to analyse why some validation cases are quite easy to predict, and some are not (especially N° 8)
+- Try to reduce the number of features considering their correlation strength, even if pca preprocessing has given deceptive results, especially for lowering execution delays of time consuming methods (bagging, treebag), but without lowering their accuracy
+- Try other types of algorithms (e.g. quadratic discriminant analysis), to have more models of different types to combine
+- Try to separate data by user (checking the resulting number of rows for each set), analyse each set separately, and use user_name information in validation dataset for selecting the appropriate model; but the purpose was to be useful for anyone after collecting a few data from volunteers, and this approach might be useful just to compare volunteers behaviours
+
+## Appendix
+
+### Plots for some of the unitary models
+
+From the models returned by the benchmark phase, we can use plot functions or summary function to draw model properties.  
+
+#### Linear Discriminant Analysis
+
+```{r appendix-plot-models-lda, fig.align="center", echo=TRUE}
+par(mfrow = c(1, 1))
+mdl <- bm$modelFits[["Linear Discriminant Analysis"]]
+plot(mdl, main = "Linear Discriminant Analysis - dimen")
+```
+
+#### Rpart
+
+```{r appendix-plot-models-rpart, fig.align="center", fig.height=8, echo=TRUE}
+par(mfrow = c(1, 1))
+mdl <- bm$modelFits[["Rpart"]]
+prp(mdl, main="Classification Tree - Rpart", extra=102, cex=0.5)
+```
+
+#### GBM with interaction.depth = c(1, 10)
+
+Note the behaviour of num_window feature.
+
+```{r appendix-plot-models-gbm, fig.align="center", fig.height=6, echo=TRUE}
+par(mfrow = c(1, 2))
+mdl <- bm$modelFits[["GBM with interaction.depth = 1, shrinkage = 0.1"]]
+summary(mdl, las = 1, cex.lab = 0.6, cex.axis = 0.6, cex = 0.6,
+        main = "Importance of features - GBM 1")
+
+mdl <- bm$modelFits[["GBM with interaction.depth = 10, shrinkage = 0.1"]]
+summary(mdl, las = 1, cex.lab = 0.6, cex.axis = 0.6, cex = 0.6,
+        main = "Importance of features - GBM 10")
+```
+
+#### Random Forest
+
+```{r appendix-plot-models-rf, fig.align="center", echo=TRUE}
+par(mfrow = c(1, 1))
+mdl <- bm$modelFits[["Random forest"]]
+plot(mdl, main = "Random forest - Error following number of trees")
+```
+
+### R code
+
+The follwing chunks of code were not displayed in the report for an easier reading.
+
+Feel free to use and modify this code for your own future analysis.
+
+#### data-explore
+```{r appendix-data-explore-1, ref.label='data-explore-1', echo=TRUE, eval=FALSE}
+
+```
+```{r appendix-data-explore-2, ref.label='data-explore-2', echo=TRUE, eval=FALSE}
+
+```
+#### train-test-dataset
+```{r appendix-train-test-dataset, ref.label='train-test-dataset', echo=TRUE, eval=FALSE}
+
+```
+
+#### benchmark-functions
+```{r appendix-benchmark-functions, ref.label='benchmark-functions', echo=TRUE, eval=FALSE}
+
+```
+
+#### benchmark-analysis
+```{r appendix-benchmark-analysis, ref.label='benchmark-analysis', echo=TRUE, eval=FALSE}
+
+```
+
+#### benchmark-analysis-results
+```{r appendix-benchmark-analysis-results, ref.label='benchmark-analysis-results', echo=TRUE, eval=FALSE}
+
+```
+
+#### benchmark-combine
+```{r appendix-benchmark-combine, ref.label='benchmark-combine', echo=TRUE, eval=FALSE}
+
+```
+
+#### benchmark-combine-results
+```{r appendix-benchmark-combine-results, ref.label='benchmark-combine-results', echo=TRUE, eval=FALSE}
+
+```
+
